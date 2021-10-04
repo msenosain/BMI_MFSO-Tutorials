@@ -1,6 +1,6 @@
-# BMI_MFSO-Tutorials
+# BMI_MFSO-Tutorial
 
-## 1. Differential gene expression analysis
+## Differential gene expression analysis
 ### Resources
 * http://bioconductor.org/packages/release/bioc/vignettes/DESeq2/inst/doc/DESeq2.html#about-the-pasilla-dataset
 * https://master.bioconductor.org/packages/release/workflows/vignettes/rnaseqGene/inst/doc/rnaseqGene.html#experimental-data
