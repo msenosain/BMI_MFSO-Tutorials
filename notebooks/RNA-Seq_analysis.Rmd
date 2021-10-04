@@ -1,0 +1,300 @@
+---
+title: "Differential gene expression analysis"
+author: "Mafe Senosain"
+date: "10/4/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load packages
+```{r}
+if (!require("pacman")) install.packages("pacman")
+pacman::p_load(dplyr,tidyr,DESeq2,edgeR,limma,ComplexHeatmap,EnhancedVolcano,tibble,fgsea,stringr,org.Hs.eg.db)
+```
+
+## Load data
+```{r}
+raw_counts <- read.csv('../data/raw_counts.csv')
+sample_info <- read.csv('../data/rnaseq_sampleinfo.csv')
+```
+
+## Remove low variance genes
+```{r}
+idx <- edgeR::filterByExpr(raw_counts[,9:ncol(raw_counts)], group = sample_info$Group)
+raw_counts <- raw_counts[idx, ]
+```
+
+### Optional: Remove especific type of genes
+```{r}
+table(raw_counts$Feature_gene_biotype)
+
+# Keep protein-coding genes only
+idx <- which(raw_counts$Feature_gene_biotype == 'protein_coding')
+raw_counts <- raw_counts[idx, ]
+
+# Remove sex genes
+idx <- which(raw_counts$Feature_chr %in% c('chrX', 'chrY'))
+raw_counts <- raw_counts[-idx, ]
+```
+
+### Batch effect and normalization
+
+### Normalize raw counts
+```{r}
+# Create a separate matrix with counts only
+counts_only <- raw_counts[, 9:ncol(raw_counts)]
+rownames(counts_only) <- raw_counts$Feature
+
+# Include batch information if there is any
+sample_info$Batch <- as.factor(sample_info$Batch)
+dds <- DESeqDataSetFromMatrix(
+  countData = counts_only,
+  colData = sample_info,
+  design = ~Batch, tidy = F  
+)
+
+# Compute normalization factors
+dds <- estimateSizeFactors(dds)
+sizeFactors(dds)
+
+# Apply VST normalization
+vsd <- vst(dds)
+vsd_mat <- assay(vsd)
+```
+
+### Assess batch effect
+```{r}
+plotPCA(vsd, "Batch") + labs(color='Batch') + ggtitle("Batch effect") 
+```
+
+### Remove batch effect if necessary
+```{r}
+assay(vsd) <- limma::removeBatchEffect(assay(vsd), batch=vsd$Batch)
+plotPCA(vsd, "Batch") + labs(color='Batch') + ggtitle("Batch after BE removal")
+
+vsd_mat_BEremv <- assay(vsd)
+```
+
+## Differential gene expression analysis
+```{r}
+sample_info$Group <- as.factor(sample_info$Group)
+# DE design
+dds <- DESeqDataSetFromMatrix(
+  countData = counts_only,
+  colData = sample_info,
+  design = ~Group, tidy = F) #design = ~Batch + Group, tidy = F)
+dds <- estimateSizeFactors(dds)
+
+# relevel groups if necessary (reference can be your control group)
+dds$Group <- relevel(dds$Group, ref = 'A')
+
+# Run DESeq
+dds <- DESeq(dds, parallel = F)
+
+# Get results
+res <- results(dds, contrast = c('Group', 'B', 'A')) #condition, numerator, denominator
+res_df <- data.frame(res) %>% mutate(gene=rownames(.)) %>% as_tibble()
+
+# Generate a transformed matrix with gene symbols
+ens2symbol <- data.frame(cbind(ENSEMBL=as.character(raw_counts$Feature), 
+                               symbol=as.character(raw_counts$Feature_gene_name)))
+res_df <- res_df %>% 
+  na.omit() %>%
+  inner_join(., ens2symbol, by=c("gene"="ENSEMBL")) %>%
+  relocate(symbol, gene)
+    
+```
+
+### Print table with top DE genes
+```{r}
+n_genes = 30
+top_genes <- res_df %>%
+  na.omit() %>%
+  filter(abs(log2FoldChange) > 1.5) %>%
+  filter(pvalue < 0.05) %>%
+  arrange(desc(abs(log2FoldChange)), pvalue) %>%
+  head(n_genes) %>%
+  dplyr::select(gene) %>%
+  pull()
+
+as_tibble(res_df[res_df$gene %in% top_genes,])
+```
+
+### Heatmap of top DE genes
+```{r}
+
+# Use normalized data for plot
+filtered_res <- data.frame(vsd_mat) %>%
+  filter(rownames(.) %in% top_genes)%>%
+  mutate(gene=rownames(.)) %>%
+  inner_join(., ens2symbol, by=c("gene"="ENSEMBL"))
+
+# Change gene id for symbol
+rownames(filtered_res) <- make.names(filtered_res$symbol, unique=TRUE)
+filtered_res$gene <- NULL
+filtered_res$symbol <- NULL
+    
+# Heatmap annotation
+ha = HeatmapAnnotation(
+  Group = as.factor(sample_info$Group), 
+  simple_anno_size = unit(0.5, "cm")
+)
+
+# Plot heatmap
+Heatmap(filtered_res, name = "mat", 
+      #column_km = 2, 
+      #row_km = 2,
+      column_split =as.factor(sample_info$Group),
+      heatmap_legend_param = list(color_bar = "continuous"), 
+      row_names_gp = gpar(fontsize = 8),
+      column_names_gp = gpar(fontsize = 8), top_annotation = ha)
+
+# Plot scaled values
+filtered_res_sc <- t(scale(t(as.matrix(filtered_res))))
+Heatmap(filtered_res_sc, name = "mat", 
+      #column_km = 2, 
+      #row_km = 2,
+      column_split =as.factor(sample_info$Group),
+      heatmap_legend_param = list(color_bar = "continuous"), 
+      row_names_gp = gpar(fontsize = 8),
+      column_names_gp = gpar(fontsize = 8), top_annotation = ha)
+```
+
+### Volcano plot of DE genes
+```{r}
+EnhancedVolcano(res_df,
+        lab = res_df$symbol,
+        x = 'log2FoldChange',
+        y = 'pvalue',
+        pCutoff=0.05,
+        FCcutoff=1.5,
+        xlim = c(-5,5),
+        pointSize=2,
+        labSize=4,
+        title = 'DE genes B vs A')
+```
+
+## Pathway analysis (fgsea)
+
+```{r} 
+# Get ranks
+ranks <- res_df %>%
+      dplyr::select(symbol,stat) %>%
+      na.omit() %>% 
+      distinct() %>% 
+      group_by(symbol) %>% 
+      summarize(stat=mean(stat)) %>%
+      arrange(stat)
+ranks <- deframe(ranks)
+```
+
+### Hallmark pathways
+```{r}
+hallmark_path <- '../data/GSEA/h.all.v7.1.symbols.gmt'
+pth <- gmtPathways(hallmark_path)
+res_hallmark <- fgseaMultilevel(pathways=pth, stats=ranks, eps = 0, nPermSimple = 10000) %>%
+            as_tibble %>%
+            arrange(padj, desc(abs(NES)))
+res_hallmark$state <- ifelse(res_hallmark$NES > 0, "up", "down")
+res_hallmark$leadingEdge <- sapply(res_hallmark$leadingEdge, . %>% {
+  str_c(., collapse = " ")})
+
+res_hallmark <- res_hallmark %>% relocate(state, .after = pathway)
+
+as_tibble(res_hallmark)
+```
+
+### REACTOME pathways
+```{r}
+hs <- org.Hs.eg.db
+my.symbols <- c(names(ranks))
+entrz <- AnnotationDbi::select(hs, 
+    keys = my.symbols,
+    columns = c("ENTREZID", "SYMBOL"),
+    keytype = "SYMBOL")
+entrz <- na.omit(entrz)
+ranks <- ranks[entrz$SYMBOL]
+names(ranks) <- entrz$ENTREZID
+pth <- reactomePathways(names(ranks))
+
+res_reactome <- fgseaMultilevel(pathways=pth, stats=ranks, eps = 0, nPermSimple = 10000) %>%
+            as_tibble %>%
+            arrange(padj, desc(abs(NES)))
+res_reactome$state <- ifelse(res_reactome$NES > 0, "up", "down")
+res_reactome$leadingEdge <- sapply(res_reactome$leadingEdge, . %>% {
+  str_c(., collapse = " ")})
+
+res_reactome <- res_reactome %>% relocate(state, .after = pathway)
+
+as_tibble(res_reactome)
+```
+
+### Plot
+```{r}
+fgsea_plot <- function(fgsea_res, pathways_title, cutoff = 0.05, 
+    max_pathways = 30, condition_name){
+
+        color_levels <- function(fgsea_res) {
+            colors <- c()
+            if (any(fgsea_res$state == "down")) {
+              colors <- c(colors, "lightblue")
+            }
+            if (any(fgsea_res$state == "up")) {
+              colors <- c(colors, "#DC143C")
+            }
+            colors
+        }
+
+        # Add * code for p vals
+        fgsea_res$pvlabel <- '*'
+        fgsea_res$pvlabel[which(fgsea_res$padj <0.01 & fgsea_res$padj>0.001)] <- '**'
+        fgsea_res$pvlabel[which(fgsea_res$padj<0.001)] <- '***'
+
+        if (!is.null(cutoff)) {
+            fgsea_res <- fgsea_res %>% filter(padj < cutoff)
+        }
+        
+        curated_pathways <- fgsea_res %>%
+                arrange(desc(abs(NES))) %>%
+                dplyr::slice(1:max_pathways)
+        curated_pathways['leadingEdge'] <- NULL
+        print(ggplot(curated_pathways, aes(reorder(pathway, NES), NES)) +
+            geom_col(aes(fill = state), width = 0.5, color = "black") +
+            scale_size_manual(values = c(0, 1), guide = "none") +
+            geom_label(aes(label = pvlabel), size = 3, alpha = 0.75) +
+            coord_flip() +
+            labs(
+                x = 'Pathway', 
+                y = "Normalized Enrichment Score",
+                title = str_c(pathways_title, " pathways: ", condition_name),
+                subtitle = str_c("(Cutoff: p.adj <", cutoff, ")")
+            ) +
+            theme_bw() +
+            scale_fill_manual(values = color_levels(curated_pathways)))
+
+        fgsea_res <- fgsea_res %>% 
+                dplyr::select(-leadingEdge, -ES) %>% 
+                arrange(desc(abs(NES)))
+
+        DT::datatable(fgsea_res, options = list(autoWidth = FALSE, scrollX=TRUE))
+}
+
+```
+
+```{r}
+fgsea_plot(res_hallmark, pathways_title='Hallmark pathways:', 
+           cutoff = 0.05, max_pathways = 10, condition_name = 'B vs A')
+
+fgsea_plot(res_reactome, pathways_title='Hallmark pathways:', 
+           cutoff = 0.05, max_pathways = 10, condition_name = 'B vs A')
+```
+
+
+
+
+
+
+
