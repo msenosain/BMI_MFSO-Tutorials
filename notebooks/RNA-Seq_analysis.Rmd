@@ -28,7 +28,7 @@ raw_counts <- raw_counts[idx, ]
 ```
 
 ### Optional: Remove especific type of genes
-```{r}
+```{r, eval=FALSE}
 table(raw_counts$Feature_gene_biotype)
 
 # Keep protein-coding genes only
@@ -71,7 +71,7 @@ plotPCA(vsd, "Batch") + labs(color='Batch') + ggtitle("Batch effect")
 ```
 
 ### Remove batch effect if necessary
-```{r}
+```{r, eval=FALSE}
 assay(vsd) <- limma::removeBatchEffect(assay(vsd), batch=vsd$Batch)
 plotPCA(vsd, "Batch") + labs(color='Batch') + ggtitle("Batch after BE removal")
 
